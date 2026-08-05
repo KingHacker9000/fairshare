@@ -19,7 +19,8 @@
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "@types/node": "^24.2.0"
   },
   "types": "./dist/index.d.ts"
 }

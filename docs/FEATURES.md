@@ -15,7 +15,7 @@
 - Multi-currency expenses, live FX lookup, stored-rate schema, and conversion-ready API design.
 - Recurring weekly, monthly, and yearly expense rules.
 - Spending totals by category and month.
-- CSV exports and a schema suitable for future Splitwise CSV import.
+- CSV expense exports and bank-statement CSV transaction import, with imported purchases attachable to an expense.
 - Default debt simplification with the ability to retain direct balances at the data layer.
 
 ## Production hardening included
@@ -24,7 +24,8 @@
 
 ## Remaining release integrations
 
+- Live credit/debit-card transaction feeds require a supported open-banking provider and credentials; CSV transaction import is implemented now.
 - Push notifications require an Expo project and APNs/FCM credentials.
-- Email invitations require a configured provider such as Resend.
+- Email delivery for invitations requires a configured provider such as Resend; invite records and automatic joining are implemented.
 - App-store payments are intentionally absent because all features are enabled in this self-hosted edition.
 - OCR requires `OCR_PROVIDER=openai` plus a compatible API key; without it, manual receipt entry remains available.

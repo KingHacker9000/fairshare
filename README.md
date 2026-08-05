@@ -13,9 +13,10 @@ FairShare is a self-hosted, legally distinct shared-expense app inspired by the 
 - Camera/gallery receipt OCR and line-item extraction
 - Live currency-rate endpoint and multi-currency data model
 - Recurring expenses, advanced search, category/month summaries, CSV export
+- Bank-statement CSV transaction import with one-tap conversion into shared expenses
 - Docker Compose deployment, host-Caddy snippet, CI, health checks, backups
 
-See `docs/FEATURES.md` and `docs/ARCHITECTURE.md`.
+See `docs/FEATURES.md`, `docs/PRO_PARITY.md`, and `docs/ARCHITECTURE.md`.
 
 ## Local development
 
