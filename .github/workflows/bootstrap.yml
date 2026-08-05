@@ -3,8 +3,7 @@ name: Bootstrap FairShare
 on:
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/bootstrap.yml'
+  workflow_dispatch:
 
 permissions:
   contents: write
