@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "FairShare",
+    "slug": "fairshare",
+    "scheme": "fairshare",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/favicon.png"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ashishajin.fairshare"
+    },
+    "android": {
+      "package": "com.ashishajin.fairshare",
+      "adaptiveIcon": {
+        "backgroundColor": "#F4F7F5"
+      }
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "FairShare uses receipt photos to itemize shared expenses.",
+          "cameraPermission": "FairShare uses the camera to scan receipts.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

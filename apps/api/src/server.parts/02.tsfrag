@@ -1,0 +1,103 @@
+    unitPriceMinor: z.number().int().nonnegative(),
+    totalMinor: z.number().int().nonnegative(),
+    assignedUserIds: z.array(z.string()).min(1),
+  })).max(300).optional(),
+  originalAmountMinor: z.number().int().positive().optional(),
+  originalCurrency: z.string().length(3).optional(),
+  conversionRate: z.number().positive().optional(),
+  sourceTransactionId: z.string().optional(),
+  idempotencyKey: z.string().max(120).optional(),
+});
+
+function createExpense(groupId: string, actorId: string, input: z.infer<typeof expenseSchema>): any {
+  requireGroupMember(groupId, actorId);
+  requireGroupMember(groupId, input.paidByUserId);
+  for (const share of input.shares) requireGroupMember(groupId, share.userId);
+  if (input.sourceTransactionId) {
+    const transaction = db.prepare('SELECT user_id, expense_id FROM bank_transactions WHERE id = ?').get(input.sourceTransactionId) as any;
+    if (!transaction || transaction.user_id !== actorId) throw new Error('Imported transaction not found');
+    if (transaction.expense_id) throw new Error('Imported transaction has already been split');
+  }
+  const computedShares = calculateExpenseShares(input.amountMinor, input.splitMethod, input.shares);
+  const expenseId = id('exp');
+  const now = nowIso();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO expenses
+       (id, group_id, description, category, amount_minor, currency, paid_by_user_id, incurred_at, split_method, notes, receipt_items_json, original_amount_minor, original_currency, conversion_rate, converted_at, source_transaction_id, idempotency_key, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(expenseId, groupId, input.description, input.category, input.amountMinor, input.currency.toUpperCase(), input.paidByUserId, input.incurredAt, input.splitMethod, input.notes ?? null, input.receiptItems ? JSON.stringify(input.receiptItems) : null, input.originalAmountMinor ?? null, input.originalCurrency?.toUpperCase() ?? null, input.conversionRate ?? null, input.conversionRate ? now : null, input.sourceTransactionId ?? null, input.idempotencyKey ?? null, actorId, now, now);
+    const statement = db.prepare('INSERT INTO expense_shares (expense_id, user_id, owed_minor) VALUES (?, ?, ?)');
+    for (const [participantId, amount] of Object.entries(computedShares)) statement.run(expenseId, participantId, amount);
+    if (input.sourceTransactionId) db.prepare('UPDATE bank_transactions SET expense_id = ? WHERE id = ?').run(expenseId, input.sourceTransactionId);
+    db.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').run(now, groupId);
+    emitChange(groupUserIds(groupId), 'expense', expenseId, 'create', { id: expenseId, groupId, ...input, shares: computedShares });
+  })();
+  return { id: expenseId, groupId, ...input, shares: computedShares };
+}
+
+app.post('/api/groups/:groupId/expenses', async (request, reply) => {
+  const actorId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  const input = expenseSchema.parse(request.body);
+  if (input.idempotencyKey) {
+    const existing = db.prepare('SELECT id FROM expenses WHERE created_by = ? AND idempotency_key = ?').get(actorId, input.idempotencyKey) as any;
+    if (existing) return reply.status(200).send({ id: existing.id, duplicate: true });
+  }
+  return reply.status(201).send(createExpense(groupId, actorId, input));
+});
+
+app.delete('/api/expenses/:expenseId', async (request, reply) => {
+  const actorId = requireUser(request);
+  const { expenseId } = request.params as { expenseId: string };
+  const expense = db.prepare('SELECT group_id FROM expenses WHERE id = ? AND deleted_at IS NULL').get(expenseId) as any;
+  if (!expense) throw new Error('Expense not found');
+  requireGroupMember(expense.group_id, actorId);
+  db.prepare('UPDATE expenses SET deleted_at = ?, updated_at = ? WHERE id = ?').run(nowIso(), nowIso(), expenseId);
+  emitChange(groupUserIds(expense.group_id), 'expense', expenseId, 'delete', { id: expenseId });
+  return reply.status(204).send();
+});
+
+const paymentSchema = z.object({
+  fromUserId: z.string(),
+  toUserId: z.string(),
+  amountMinor: z.number().int().positive(),
+  currency: z.string().length(3),
+  paidAt: z.string().datetime(),
+  notes: z.string().max(1000).optional(),
+  idempotencyKey: z.string().max(120).optional(),
+});
+
+function createPayment(groupId: string, actorId: string, input: z.infer<typeof paymentSchema>): any {
+  requireGroupMember(groupId, actorId);
+  requireGroupMember(groupId, input.fromUserId);
+  requireGroupMember(groupId, input.toUserId);
+  if (input.fromUserId === input.toUserId) throw new Error('Payment parties must be different');
+  const paymentId = id('pay');
+  const createdAt = nowIso();
+  db.prepare(
+    `INSERT INTO payments (id, group_id, from_user_id, to_user_id, amount_minor, currency, paid_at, notes, idempotency_key, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(paymentId, groupId, input.fromUserId, input.toUserId, input.amountMinor, input.currency.toUpperCase(), input.paidAt, input.notes ?? null, input.idempotencyKey ?? null, actorId, createdAt);
+  emitChange(groupUserIds(groupId), 'payment', paymentId, 'create', { id: paymentId, groupId, ...input });
+  return { id: paymentId, groupId, ...input };
+}
+
+app.post('/api/groups/:groupId/payments', async (request, reply) => {
+  const actorId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  const input = paymentSchema.parse(request.body);
+  return reply.status(201).send(createPayment(groupId, actorId, input));
+});
+
+app.get('/api/groups/:groupId/balances', async (request) => {
+  const userId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, userId);
+  const group = db.prepare('SELECT currency FROM groups WHERE id = ?').get(groupId) as any;
+  if (!group) throw new Error('Group not found');
+  return { defaultCurrency: String(group.currency), balances: calculateGroupBalances(groupId, String(group.currency)) };
+});
+
+app.get('/api/groups/:groupId/stats', async (request) => {
+  const userId = requireUser(request);

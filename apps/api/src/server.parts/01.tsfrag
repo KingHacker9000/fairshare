@@ -1,0 +1,120 @@
+    return { ...groupDetails(String(row.id), userId), balances, balance: balances.find((item) => item.currency === String(row.currency).toUpperCase()) ?? balances[0] };
+  });
+});
+
+app.post('/api/groups', async (request, reply) => {
+  const userId = requireUser(request);
+  const body = z.object({
+    name: z.string().trim().min(1).max(100),
+    type: z.enum(['trip', 'home', 'couple', 'other']).default('other'),
+    currency: z.string().length(3).default('USD'),
+    simplifyDebts: z.boolean().default(true),
+  }).parse(request.body);
+  const groupId = id('grp');
+  const now = nowIso();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO groups (id, name, type, currency, simplify_debts, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(groupId, body.name, body.type, body.currency.toUpperCase(), body.simplifyDebts ? 1 : 0, userId, now, now);
+    db.prepare('INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)').run(groupId, userId, 'owner', now);
+    emitChange([userId], 'group', groupId, 'create', body);
+  })();
+  return reply.status(201).send(groupDetails(groupId, userId));
+});
+
+app.get('/api/groups/:groupId', async (request) => {
+  const userId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  const group = db.prepare('SELECT currency FROM groups WHERE id = ?').get(groupId) as any;
+  if (!group) throw new Error('Group not found');
+  const balances = calculateGroupBalances(groupId, String(group.currency));
+  return { ...groupDetails(groupId, userId), balances, balance: balances.find((item) => item.currency === String(group.currency).toUpperCase()) ?? balances[0] };
+});
+
+app.post('/api/groups/:groupId/members', async (request, reply) => {
+  const actorId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, actorId);
+  const body = z.object({ email: z.string().email().transform((value) => value.toLowerCase()) }).parse(request.body);
+  const target = db.prepare('SELECT id FROM users WHERE email = ?').get(body.email) as any;
+  if (!target) {
+    const existing = db.prepare('SELECT id FROM invitations WHERE group_id = ? AND email = ? AND accepted_at IS NULL').get(groupId, body.email) as any;
+    if (!existing) {
+      db.prepare(
+        `INSERT INTO invitations (id, group_id, email, token_hash, invited_by, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id('inv'), groupId, body.email, id('token'), actorId, new Date(Date.now() + 30 * 86400000).toISOString(), nowIso());
+    }
+    return reply.status(202).send({ invited: true, email: body.email, message: 'Invitation saved. The member will join automatically after registering with this email.' });
+  }
+  db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)').run(groupId, target.id, 'member', nowIso());
+  const details = groupDetails(groupId, actorId);
+  emitChange(groupUserIds(groupId), 'group', groupId, 'update', details);
+  return reply.status(201).send(details);
+});
+
+
+app.put('/api/groups/:groupId/default-split', async (request) => {
+  const actorId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, actorId);
+  const body = z.object({
+    method: z.enum(['equal', 'percentage', 'shares']),
+    shares: z.array(z.object({ userId: z.string(), value: z.number().nonnegative().optional(), included: z.boolean().optional() })).min(1),
+  }).parse(request.body);
+  for (const share of body.shares) requireGroupMember(groupId, share.userId);
+  calculateExpenseShares(10_000, body.method, body.shares);
+  const updatedAt = nowIso();
+  db.prepare('UPDATE groups SET default_split_method = ?, default_shares_json = ?, updated_at = ? WHERE id = ?')
+    .run(body.method, JSON.stringify(body.shares), updatedAt, groupId);
+  const details = groupDetails(groupId, actorId);
+  emitChange(groupUserIds(groupId), 'group', groupId, 'update', details);
+  return details;
+});
+
+app.get('/api/groups/:groupId/expenses', async (request) => {
+  const userId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, userId);
+  const rows = db.prepare(
+    `SELECT e.*, u.display_name AS paid_by_name FROM expenses e JOIN users u ON u.id = e.paid_by_user_id
+     WHERE e.group_id = ? AND e.deleted_at IS NULL ORDER BY e.incurred_at DESC, e.created_at DESC LIMIT 500`,
+  ).all(groupId) as any[];
+  const shareStatement = db.prepare(
+    `SELECT s.user_id, s.owed_minor, u.display_name FROM expense_shares s JOIN users u ON u.id = s.user_id WHERE s.expense_id = ?`,
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    groupId: row.group_id,
+    description: row.description,
+    category: row.category,
+    amountMinor: row.amount_minor,
+    currency: row.currency,
+    paidByUserId: row.paid_by_user_id,
+    paidByName: row.paid_by_name,
+    incurredAt: row.incurred_at,
+    splitMethod: row.split_method,
+    notes: row.notes,
+    receiptItems: row.receipt_items_json ? json(row.receipt_items_json) : [],
+    originalAmountMinor: row.original_amount_minor,
+    originalCurrency: row.original_currency,
+    conversionRate: row.conversion_rate,
+    sourceTransactionId: row.source_transaction_id,
+    shares: (shareStatement.all(row.id) as any[]).map((share) => ({ userId: share.user_id, displayName: share.display_name, owedMinor: share.owed_minor })),
+  }));
+});
+
+const expenseSchema = z.object({
+  description: z.string().trim().min(1).max(200),
+  category: z.string().trim().min(1).max(50).default('general'),
+  amountMinor: z.number().int().positive(),
+  currency: z.string().length(3),
+  paidByUserId: z.string().min(5),
+  incurredAt: z.string().datetime(),
+  splitMethod: z.enum(['equal', 'exact', 'percentage', 'shares', 'adjustment']),
+  shares: z.array(z.object({ userId: z.string(), value: z.number().optional(), included: z.boolean().optional() })).min(1),
+  notes: z.string().max(2000).optional(),
+  receiptItems: z.array(z.object({
+    description: z.string().max(300),
+    quantity: z.number().positive(),

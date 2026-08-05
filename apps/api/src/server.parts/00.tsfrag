@@ -1,0 +1,128 @@
+import { createWriteStream, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { unlink } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { calculateExpenseShares, parseDecimalToMinor, type ExpenseInput } from '@fairshare/shared';
+import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
+import rateLimit from '@fastify/rate-limit';
+import Fastify from 'fastify';
+import { z } from 'zod';
+import { createSession, hashPassword, requestUserId, rotateSession, verifyPassword } from './auth.js';
+import { calculateGroupBalance, calculateGroupBalances } from './balances.js';
+import { db, emitChange, groupUserIds, id, json, nowIso } from './db.js';
+import { env } from './env.js';
+import { scanReceipt } from './receipt.js';
+import { runRecurringExpenses } from './recurring.js';
+
+const app = Fastify({ logger: true, bodyLimit: 2 * 1024 * 1024 });
+await app.register(cors, { origin: env.APP_ORIGIN.split(',').map((value) => value.trim()), credentials: true });
+await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
+await app.register(multipart, { limits: { fileSize: 12 * 1024 * 1024, files: 1 } });
+
+app.setErrorHandler((error, request, reply) => {
+  request.log.error(error);
+  const message = error.message || 'Unexpected error';
+  const status = /Authentication|required|token/i.test(message) ? 401 : /not found/i.test(message) ? 404 : /member|permission|forbidden/i.test(message) ? 403 : 400;
+  void reply.status(status).send({ error: message });
+});
+
+function requireUser(request: any): string {
+  return requestUserId(request);
+}
+
+function requireGroupMember(groupId: string, userId: string): void {
+  const row = db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?').get(groupId, userId);
+  if (!row) throw new Error('Group membership required');
+}
+
+function userRow(userId: string): any {
+  const row = db.prepare('SELECT id, email, display_name, default_currency, avatar_url, created_at FROM users WHERE id = ?').get(userId);
+  if (!row) throw new Error('User not found');
+  return {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    defaultCurrency: row.default_currency,
+    avatarUrl: row.avatar_url,
+    createdAt: row.created_at,
+  };
+}
+
+function groupDetails(groupId: string, viewerId: string): any {
+  requireGroupMember(groupId, viewerId);
+  const group = db.prepare('SELECT * FROM groups WHERE id = ? AND archived_at IS NULL').get(groupId) as any;
+  if (!group) throw new Error('Group not found');
+  const members = db.prepare(
+    `SELECT u.id, u.email, u.display_name, u.default_currency, gm.role
+     FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = ? ORDER BY u.display_name`,
+  ).all(groupId) as any[];
+  return {
+    id: group.id,
+    name: group.name,
+    type: group.type,
+    currency: group.currency,
+    simplifyDebts: Boolean(group.simplify_debts),
+    defaultSplitMethod: group.default_split_method ?? 'equal',
+    defaultShares: group.default_shares_json ? json(group.default_shares_json) : [],
+    createdAt: group.created_at,
+    updatedAt: group.updated_at,
+    members: members.map((member) => ({
+      id: member.id,
+      email: member.email,
+      displayName: member.display_name,
+      defaultCurrency: member.default_currency,
+      role: member.role,
+    })),
+  };
+}
+
+const authBody = z.object({ email: z.string().email().transform((value) => value.toLowerCase()), password: z.string().min(8).max(200) });
+
+app.get('/health', async () => ({ ok: true, time: nowIso() }));
+
+app.post('/api/auth/register', async (request, reply) => {
+  const body = authBody.extend({ displayName: z.string().trim().min(1).max(80), defaultCurrency: z.string().length(3).default('USD') }).parse(request.body);
+  const userId = id('usr');
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO users (id, email, display_name, password_hash, default_currency, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(userId, body.email, body.displayName, hashPassword(body.password), body.defaultCurrency.toUpperCase(), now, now);
+  const invitations = db.prepare(
+    'SELECT id, group_id FROM invitations WHERE email = ? AND accepted_at IS NULL AND expires_at > ?',
+  ).all(body.email, now) as Array<{ id: string; group_id: string }>;
+  db.transaction(() => {
+    for (const invitation of invitations) {
+      db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)').run(invitation.group_id, userId, 'member', now);
+      db.prepare('UPDATE invitations SET accepted_at = ? WHERE id = ?').run(now, invitation.id);
+      emitChange(groupUserIds(invitation.group_id), 'group', invitation.group_id, 'update', { joinedUserId: userId });
+    }
+  })();
+  const tokens = createSession(userId, request.headers['user-agent']);
+  return reply.status(201).send({ user: userRow(userId), ...tokens });
+});
+
+app.post('/api/auth/login', async (request) => {
+  const body = authBody.parse(request.body);
+  const user = db.prepare('SELECT id, password_hash FROM users WHERE email = ?').get(body.email) as any;
+  if (!user || !verifyPassword(body.password, String(user.password_hash))) throw new Error('Invalid email or password');
+  return { user: userRow(String(user.id)), ...createSession(String(user.id), request.headers['user-agent']) };
+});
+
+app.post('/api/auth/refresh', async (request) => {
+  const body = z.object({ refreshToken: z.string().min(20) }).parse(request.body);
+  return rotateSession(body.refreshToken);
+});
+
+app.get('/api/me', async (request) => userRow(requireUser(request)));
+
+app.get('/api/groups', async (request) => {
+  const userId = requireUser(request);
+  const rows = db.prepare(
+    `SELECT g.* FROM groups g JOIN group_members gm ON gm.group_id = g.id
+     WHERE gm.user_id = ? AND g.archived_at IS NULL ORDER BY g.updated_at DESC`,
+  ).all(userId) as any[];
+  return rows.map((row) => {
+    const balances = calculateGroupBalances(String(row.id), String(row.currency));

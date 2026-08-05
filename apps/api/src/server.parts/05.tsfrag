@@ -1,0 +1,78 @@
+    ...rows.map((row) => [row.description, row.category, (row.amount_minor / 100).toFixed(2), row.currency, row.incurred_at, row.paid_by].map(escape).join(',')),
+  ].join('\n');
+  return reply.header('Content-Type', 'text/csv; charset=utf-8').header('Content-Disposition', `attachment; filename="fairshare-${groupId}.csv"`).send(csv);
+});
+
+app.post('/api/receipts/scan', async (request) => {
+  requireUser(request);
+  const file = await request.file();
+  if (!file) throw new Error('Receipt image is required');
+  if (!file.mimetype.startsWith('image/')) throw new Error('Receipt must be an image');
+  const storageName = `${id('receipt')}-${basename(file.filename).replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+  const path = join(env.UPLOAD_DIR, storageName);
+  await pipeline(file.file, createWriteStream(path, { flags: 'wx' }));
+  try {
+    return await scanReceipt(path, file.mimetype);
+  } finally {
+    if (existsSync(path)) await unlink(path);
+  }
+});
+
+app.post('/api/sync', async (request) => {
+  const userId = requireUser(request);
+  const body = z.object({
+    cursor: z.number().int().nonnegative().default(0),
+    mutations: z.array(z.object({
+      id: z.string(),
+      kind: z.enum(['createExpense', 'createPayment']),
+      groupId: z.string(),
+      payload: z.record(z.string(), z.unknown()),
+    })).max(100).default([]),
+  }).parse(request.body);
+  const accepted: string[] = [];
+  for (const mutation of body.mutations) {
+    try {
+      if (mutation.kind === 'createExpense') createExpense(mutation.groupId, userId, expenseSchema.parse({ ...mutation.payload, idempotencyKey: mutation.id }));
+      else createPayment(mutation.groupId, userId, paymentSchema.parse({ ...mutation.payload, idempotencyKey: mutation.id }));
+      accepted.push(mutation.id);
+    } catch (error: any) {
+      if (/UNIQUE constraint failed/.test(String(error.message))) accepted.push(mutation.id);
+      else throw error;
+    }
+  }
+  const changes = db.prepare(
+    `SELECT cursor, entity_type AS entityType, entity_id AS entityId, operation, payload_json AS payloadJson, created_at AS createdAt
+     FROM changes WHERE user_id = ? AND cursor > ? ORDER BY cursor LIMIT 1000`,
+  ).all(userId, body.cursor) as any[];
+  return {
+    accepted,
+    cursor: changes.length ? changes[changes.length - 1]!.cursor : body.cursor,
+    changes: changes.map((change) => ({ ...change, payload: json(change.payloadJson), payloadJson: undefined })),
+  };
+});
+
+app.post('/api/recurring', async (request, reply) => {
+  const userId = requireUser(request);
+  const body = z.object({ groupId: z.string(), cadence: z.enum(['weekly', 'monthly', 'yearly']), nextRunAt: z.string().datetime(), template: expenseSchema }).parse(request.body);
+  requireGroupMember(body.groupId, userId);
+  const ruleId = id('rec');
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO recurring_rules (id, group_id, template_json, cadence, next_run_at, active, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+  ).run(ruleId, body.groupId, JSON.stringify(body.template), body.cadence, body.nextRunAt, userId, now, now);
+  return reply.status(201).send({ id: ruleId, ...body, active: true });
+});
+
+const recurringTimer = setInterval(() => {
+  try {
+    const count = runRecurringExpenses();
+    if (count) app.log.info({ count }, 'created recurring expenses');
+  } catch (error) {
+    app.log.error(error, 'recurring expense worker failed');
+  }
+}, 60_000);
+recurringTimer.unref();
+
+const address = await app.listen({ port: env.PORT, host: '0.0.0.0' });
+app.log.info(`FairShare API listening at ${address}`);

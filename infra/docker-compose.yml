@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    restart: unless-stopped
+    env_file: ../.env
+    volumes:
+      - fairshare_data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 420M
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+      args:
+        EXPO_PUBLIC_API_URL: /api
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8092:80"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  fairshare_data:

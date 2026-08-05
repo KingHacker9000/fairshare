@@ -1,0 +1,114 @@
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, userId);
+  const category = db.prepare(
+    `SELECT category, currency, SUM(amount_minor) AS amountMinor, COUNT(*) AS count
+     FROM expenses WHERE group_id = ? AND deleted_at IS NULL GROUP BY category, currency ORDER BY amountMinor DESC`,
+  ).all(groupId);
+  const monthly = db.prepare(
+    `SELECT substr(incurred_at, 1, 7) AS month, currency, SUM(amount_minor) AS amountMinor, COUNT(*) AS count
+     FROM expenses WHERE group_id = ? AND deleted_at IS NULL GROUP BY month, currency ORDER BY month`,
+  ).all(groupId);
+  return { category, monthly };
+});
+
+
+function parseCsvLine(line: string, delimiter: string): string[] {
+  const cells: string[] = [];
+  let value = '';
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (character === '"') {
+      if (quoted && line[index + 1] === '"') { value += '"'; index += 1; }
+      else quoted = !quoted;
+    } else if (character === delimiter && !quoted) {
+      cells.push(value.trim());
+      value = '';
+    } else value += character;
+  }
+  cells.push(value.trim());
+  return cells;
+}
+
+function normalizeHeader(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+app.post('/api/transactions/import', async (request, reply) => {
+  const userId = requireUser(request);
+  const body = z.object({
+    csv: z.string().min(3).max(5_000_000),
+    source: z.string().trim().min(1).max(50).default('csv'),
+    defaultCurrency: z.string().length(3),
+    debitSign: z.enum(['negative', 'positive', 'all']).default('negative'),
+  }).parse(request.body);
+  const lines = body.csv.replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length < 2) throw new Error('CSV must include a header and at least one transaction');
+  const delimiter = (lines[0]!.match(/;/g)?.length ?? 0) > (lines[0]!.match(/,/g)?.length ?? 0) ? ';' : ',';
+  const headers = parseCsvLine(lines[0]!, delimiter).map(normalizeHeader);
+  const findIndex = (...names: string[]) => headers.findIndex((header) => names.includes(header));
+  const dateIndex = findIndex('date', 'transactiondate', 'posteddate', 'bookingdate');
+  const merchantIndex = findIndex('description', 'merchant', 'name', 'details', 'memo', 'narrative');
+  const amountIndex = findIndex('amount', 'transactionamount', 'value');
+  const debitIndex = findIndex('debit', 'withdrawal', 'moneyout');
+  const currencyIndex = findIndex('currency', 'currencycode', 'ccy');
+  const idIndex = findIndex('id', 'transactionid', 'reference', 'referencenumber');
+  if (dateIndex < 0 || merchantIndex < 0 || (amountIndex < 0 && debitIndex < 0)) throw new Error('CSV needs date, description/merchant, and amount or debit columns');
+  const importedAt = nowIso();
+  let imported = 0;
+  let skipped = 0;
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO bank_transactions
+     (id, user_id, external_id, source, merchant, amount_minor, currency, occurred_at, raw_json, imported_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  db.transaction(() => {
+    for (const line of lines.slice(1)) {
+      try {
+        const cells = parseCsvLine(line, delimiter);
+        const rawAmount = String(cells[debitIndex >= 0 ? debitIndex : amountIndex] ?? '').replace(/[^0-9.,+\-]/g, '');
+        const normalizedAmount = rawAmount.includes(',') && !rawAmount.includes('.') ? rawAmount.replace(',', '.') : rawAmount.replaceAll(',', '');
+        const signedMinor = parseDecimalToMinor(normalizedAmount);
+        if (!signedMinor) { skipped += 1; continue; }
+        if (debitIndex < 0 && body.debitSign === 'negative' && signedMinor > 0) { skipped += 1; continue; }
+        if (debitIndex < 0 && body.debitSign === 'positive' && signedMinor < 0) { skipped += 1; continue; }
+        const occurred = new Date(String(cells[dateIndex] ?? ''));
+        if (Number.isNaN(occurred.getTime())) { skipped += 1; continue; }
+        const merchant = String(cells[merchantIndex] ?? '').trim() || 'Imported transaction';
+        const currency = String(cells[currencyIndex] ?? body.defaultCurrency).trim().toUpperCase().slice(0, 3) || body.defaultCurrency.toUpperCase();
+        const externalId = String(cells[idIndex] ?? '').trim() || createHash('sha256').update(`${body.source}|${occurred.toISOString()}|${merchant}|${signedMinor}|${currency}`).digest('hex');
+        const result = insert.run(id('txn'), userId, externalId, body.source, merchant, Math.abs(signedMinor), currency, occurred.toISOString(), JSON.stringify(Object.fromEntries(headers.map((header, index) => [header || `column${index}`, cells[index] ?? '']))), importedAt);
+        if (result.changes) imported += 1;
+        else skipped += 1;
+      } catch {
+        skipped += 1;
+      }
+    }
+  })();
+  const transactions = db.prepare(
+    `SELECT id, merchant, amount_minor AS amountMinor, currency, occurred_at AS occurredAt, source, imported_at AS importedAt
+     FROM bank_transactions WHERE user_id = ? AND expense_id IS NULL ORDER BY occurred_at DESC LIMIT 300`,
+  ).all(userId);
+  return reply.status(201).send({ imported, skipped, transactions });
+});
+
+app.get('/api/transactions', async (request) => {
+  const userId = requireUser(request);
+  return db.prepare(
+    `SELECT id, merchant, amount_minor AS amountMinor, currency, occurred_at AS occurredAt, source, imported_at AS importedAt
+     FROM bank_transactions WHERE user_id = ? AND expense_id IS NULL ORDER BY occurred_at DESC LIMIT 300`,
+  ).all(userId);
+});
+
+app.delete('/api/transactions/:transactionId', async (request, reply) => {
+  const userId = requireUser(request);
+  const { transactionId } = request.params as { transactionId: string };
+  db.prepare('DELETE FROM bank_transactions WHERE id = ? AND user_id = ? AND expense_id IS NULL').run(transactionId, userId);
+  return reply.status(204).send();
+});
+
+app.get('/api/search', async (request) => {
+  const userId = requireUser(request);
+  const { q = '' } = request.query as { q?: string };
+  if (q.trim().length < 2) return [];
+  return db.prepare(

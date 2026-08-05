@@ -1,0 +1,96 @@
+    `SELECT e.id, e.group_id AS groupId, e.description, e.category, e.amount_minor AS amountMinor, e.currency, e.incurred_at AS incurredAt, g.name AS groupName
+     FROM expenses e JOIN groups g ON g.id = e.group_id JOIN group_members gm ON gm.group_id = g.id
+     WHERE gm.user_id = ? AND e.deleted_at IS NULL AND (e.description LIKE ? OR e.notes LIKE ? OR e.category LIKE ?)
+     ORDER BY e.incurred_at DESC LIMIT 100`,
+  ).all(userId, `%${q}%`, `%${q}%`, `%${q}%`);
+});
+
+
+async function fetchFxRate(base: string, quote: string): Promise<number> {
+  const normalizedBase = base.toUpperCase();
+  const normalizedQuote = quote.toUpperCase();
+  if (normalizedBase === normalizedQuote) return 1;
+  const url = new URL('/latest', env.FX_PROVIDER_URL);
+  url.searchParams.set('base', normalizedBase);
+  url.searchParams.set('symbols', normalizedQuote);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`FX provider failed: ${response.status}`);
+  const payload = await response.json() as { date?: string; rates?: Record<string, number> };
+  const rate = payload.rates?.[normalizedQuote];
+  if (!rate || !Number.isFinite(rate)) throw new Error(`No FX rate for ${normalizedBase}/${normalizedQuote}`);
+  db.prepare(
+    `INSERT OR REPLACE INTO exchange_rates (base_currency, quote_currency, rate, as_of, source) VALUES (?, ?, ?, ?, ?)`,
+  ).run(normalizedBase, normalizedQuote, rate, payload.date ?? nowIso().slice(0, 10), env.FX_PROVIDER_URL);
+  return rate;
+}
+
+app.get('/api/fx/latest', async (request) => {
+  requireUser(request);
+  const { base = 'USD', symbols } = request.query as { base?: string; symbols?: string };
+  const url = new URL('/latest', env.FX_PROVIDER_URL);
+  url.searchParams.set('base', base.toUpperCase());
+  if (symbols) url.searchParams.set('symbols', symbols.toUpperCase());
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`FX provider failed: ${response.status}`);
+  return response.json();
+});
+
+
+app.post('/api/groups/:groupId/convert', async (request) => {
+  const actorId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, actorId);
+  const body = z.object({ targetCurrency: z.string().length(3) }).parse(request.body);
+  const targetCurrency = body.targetCurrency.toUpperCase();
+  const expenses = db.prepare(
+    'SELECT id, amount_minor, currency, original_amount_minor, original_currency FROM expenses WHERE group_id = ? AND deleted_at IS NULL AND currency <> ?',
+  ).all(groupId, targetCurrency) as any[];
+  const payments = db.prepare(
+    'SELECT id, amount_minor, currency, original_amount_minor, original_currency FROM payments WHERE group_id = ? AND currency <> ?',
+  ).all(groupId, targetCurrency) as any[];
+  const rates = new Map<string, number>();
+  for (const currency of new Set([...expenses, ...payments].map((row) => String(row.currency).toUpperCase()))) {
+    rates.set(currency, await fetchFxRate(currency, targetCurrency));
+  }
+  const convertedAt = nowIso();
+  db.transaction(() => {
+    for (const expense of expenses) {
+      const rate = rates.get(String(expense.currency).toUpperCase())!;
+      const convertedTotal = Math.max(1, Math.round(Number(expense.amount_minor) * rate));
+      const currentShares = db.prepare('SELECT user_id, owed_minor FROM expense_shares WHERE expense_id = ?').all(expense.id) as Array<{ user_id: string; owed_minor: number }>;
+      const convertedShares = calculateExpenseShares(convertedTotal, 'shares', currentShares.map((share) => ({ userId: share.user_id, value: share.owed_minor })));
+      const originalAmount = expense.original_amount_minor ?? expense.amount_minor;
+      const originalCurrency = expense.original_currency ?? expense.currency;
+      db.prepare(
+        `UPDATE expenses SET amount_minor = ?, currency = ?, original_amount_minor = ?, original_currency = ?, conversion_rate = ?, converted_at = ?, updated_at = ? WHERE id = ?`,
+      ).run(convertedTotal, targetCurrency, originalAmount, originalCurrency, convertedTotal / Number(originalAmount), convertedAt, convertedAt, expense.id);
+      const updateShare = db.prepare('UPDATE expense_shares SET owed_minor = ? WHERE expense_id = ? AND user_id = ?');
+      for (const [userId, owedMinor] of Object.entries(convertedShares)) updateShare.run(owedMinor, expense.id, userId);
+    }
+    for (const payment of payments) {
+      const rate = rates.get(String(payment.currency).toUpperCase())!;
+      const convertedTotal = Math.max(1, Math.round(Number(payment.amount_minor) * rate));
+      const originalAmount = payment.original_amount_minor ?? payment.amount_minor;
+      const originalCurrency = payment.original_currency ?? payment.currency;
+      db.prepare(
+        `UPDATE payments SET amount_minor = ?, currency = ?, original_amount_minor = ?, original_currency = ?, conversion_rate = ?, converted_at = ? WHERE id = ?`,
+      ).run(convertedTotal, targetCurrency, originalAmount, originalCurrency, convertedTotal / Number(originalAmount), convertedAt, payment.id);
+    }
+    db.prepare('UPDATE groups SET currency = ?, updated_at = ? WHERE id = ?').run(targetCurrency, convertedAt, groupId);
+    emitChange(groupUserIds(groupId), 'group', groupId, 'update', { convertedTo: targetCurrency, convertedAt });
+  })();
+  const balances = calculateGroupBalances(groupId, targetCurrency);
+  return { convertedExpenses: expenses.length, convertedPayments: payments.length, targetCurrency, balances };
+});
+
+app.get('/api/groups/:groupId/export.csv', async (request, reply) => {
+  const userId = requireUser(request);
+  const { groupId } = request.params as { groupId: string };
+  requireGroupMember(groupId, userId);
+  const rows = db.prepare(
+    `SELECT e.description, e.category, e.amount_minor, e.currency, e.incurred_at, u.display_name AS paid_by
+     FROM expenses e JOIN users u ON u.id = e.paid_by_user_id WHERE e.group_id = ? AND e.deleted_at IS NULL ORDER BY e.incurred_at`,
+  ).all(groupId) as any[];
+  const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
+  const csv = [
+    ['Description', 'Category', 'Amount', 'Currency', 'Date', 'Paid by'].map(escape).join(','),

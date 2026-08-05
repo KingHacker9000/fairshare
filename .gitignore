@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+dist/
+.expo/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+uploads/
+coverage/
+.DS_Store
+apps/api/src/server.generated.ts
