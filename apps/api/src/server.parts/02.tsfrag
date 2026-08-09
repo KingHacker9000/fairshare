@@ -2,6 +2,7 @@
     totalMinor: z.number().int().nonnegative(),
     assignedUserIds: z.array(z.string()).min(1),
   })).max(300).optional(),
+  receiptDocument: z.record(z.string(), z.unknown()).optional(),
   originalAmountMinor: z.number().int().positive().optional(),
   originalCurrency: z.string().length(3).optional(),
   conversionRate: z.number().positive().optional(),
@@ -27,6 +28,11 @@ function createExpense(groupId: string, actorId: string, input: z.infer<typeof e
        (id, group_id, description, category, amount_minor, currency, paid_by_user_id, incurred_at, split_method, notes, receipt_items_json, original_amount_minor, original_currency, conversion_rate, converted_at, source_transaction_id, idempotency_key, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(expenseId, groupId, input.description, input.category, input.amountMinor, input.currency.toUpperCase(), input.paidByUserId, input.incurredAt, input.splitMethod, input.notes ?? null, input.receiptItems ? JSON.stringify(input.receiptItems) : null, input.originalAmountMinor ?? null, input.originalCurrency?.toUpperCase() ?? null, input.conversionRate ?? null, input.conversionRate ? now : null, input.sourceTransactionId ?? null, input.idempotencyKey ?? null, actorId, now, now);
+    if (input.receiptDocument) {
+      db.prepare(
+        `INSERT INTO receipt_documents (expense_id, structured_json, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+      ).run(expenseId, JSON.stringify(input.receiptDocument), now, now);
+    }
     const statement = db.prepare('INSERT INTO expense_shares (expense_id, user_id, owed_minor) VALUES (?, ?, ?)');
     for (const [participantId, amount] of Object.entries(computedShares)) statement.run(expenseId, participantId, amount);
     if (input.sourceTransactionId) db.prepare('UPDATE bank_transactions SET expense_id = ? WHERE id = ?').run(expenseId, input.sourceTransactionId);
