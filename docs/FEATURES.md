@@ -11,7 +11,11 @@
 ## Premium-grade tools
 
 - Unlimited entries and groups; no advertising layer.
-- Camera or gallery receipt scan with structured itemization through a configurable vision provider.
+- Camera or gallery receipt scan using free local Tesseract OCR on the FairShare server.
+- Receipt image preprocessing, line-item extraction, OCR confidence, arithmetic reconciliation, and manual OCR correction.
+- Fast item-to-person matching with Me / Everyone / Same as above shortcuts.
+- Proportional tax/VAT/GST, service-charge, tip, fee, discount and rounding allocation with exact-cent conservation.
+- Structured receipt audit documents stored alongside expenses.
 - Multi-currency expenses, live FX lookup, stored-rate schema, and conversion-ready API design.
 - Recurring weekly, monthly, and yearly expense rules.
 - Spending totals by category and month.
@@ -24,8 +28,9 @@
 
 ## Remaining release integrations
 
+- Multi-photo stitching for exceptionally long supermarket receipts.
+- Optional on-device mobile OCR can later move scanning from the server to ML Kit without changing the parser or accounting engine.
 - Live credit/debit-card transaction feeds require a supported open-banking provider and credentials; CSV transaction import is implemented now.
 - Push notifications require an Expo project and APNs/FCM credentials.
 - Email delivery for invitations requires a configured provider such as Resend; invite records and automatic joining are implemented.
 - App-store payments are intentionally absent because all features are enabled in this self-hosted edition.
-- OCR requires `OCR_PROVIDER=openai` plus a compatible API key; without it, manual receipt entry remains available.
