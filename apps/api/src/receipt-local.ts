@@ -77,7 +77,10 @@ function parseMoneyToken(raw: string): number | undefined {
 }
 
 function finalMoney(line: string): { amountMinor: number; source: string; start: number } | undefined {
-  const candidates = [...line.matchAll(/-?\(?\d[\d\s,.]*\d(?:[.,]\d{1,3})?\)?/g)];
+  // Keep separate monetary columns separate (for example "2 x 14.50  29.00") while still
+  // accepting grouped thousands such as "1 234.56" or "1,234.56".
+  const moneyToken = /-?\(?\d{1,3}(?:[ ,]\d{3})+(?:[.,]\d{1,3})?\)?|-?\(?\d+(?:[.,]\d{1,3})?\)?/g;
+  const candidates = [...line.matchAll(moneyToken)];
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const match = candidates[index]!;
     const after = line.slice((match.index ?? 0) + match[0].length);
@@ -118,20 +121,16 @@ function detectCurrency(text: string): string | undefined {
 }
 
 function detectDate(text: string): string | undefined {
-  const candidates = [
-    /\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/,
-    /\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b/,
-  ];
-  for (const pattern of candidates) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const year = pattern === candidates[0] ? Number(match[1]) : Number(match[3]);
-    const month = pattern === candidates[0] ? Number(match[2]) : Number(match[2]);
-    const day = pattern === candidates[0] ? Number(match[3]) : Number(match[1]);
-    const date = new Date(Date.UTC(year, month - 1, day, 12));
-    if (!Number.isNaN(date.getTime()) && date.getUTCMonth() === month - 1) return date.toISOString();
-  }
-  return undefined;
+  const ymd = text.match(/\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/);
+  const dmy = text.match(/\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})\b/);
+  const match = ymd ?? dmy;
+  if (!match) return undefined;
+  const year = ymd ? Number(match[1]) : Number(match[3]);
+  const month = Number(match[2]);
+  const day = ymd ? Number(match[3]) : Number(match[1]);
+  const date = new Date(Date.UTC(year, month - 1, day, 12));
+  if (Number.isNaN(date.getTime()) || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return undefined;
+  return date.toISOString();
 }
 
 function merchantFrom(lines: OcrLine[]): string | undefined {
@@ -232,7 +231,7 @@ export function parseReceiptLines(lines: OcrLine[]): ReceiptScanResult {
 
   const taxMinor = adjustments.filter((adjustment) => adjustment.kind === 'tax' && !adjustment.includedInItemPrices).reduce((sum, adjustment) => sum + adjustment.amountMinor, 0);
   const tipMinor = adjustments.filter((adjustment) => adjustment.kind === 'tip').reduce((sum, adjustment) => sum + adjustment.amountMinor, 0);
-  const result: ReceiptScanResult = {
+  const result = {
     merchant: merchantFrom(sorted),
     currency: detectCurrency(allText),
     purchasedAt: detectDate(allText),
@@ -327,7 +326,7 @@ async function runTesseract(input: string, pageSegmentationMode: number): Promis
     '-l', env.TESSERACT_LANG,
     'tsv',
   ], { maxBuffer: 20 * 1024 * 1024, timeout: 45_000 });
-  return parseTesseractTsv(stdout);
+  return parseTesseractTsv(String(stdout));
 }
 
 export async function scanReceiptLocally(path: string): Promise<ReceiptScanResult> {
