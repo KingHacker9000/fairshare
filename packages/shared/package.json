@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/splits.test.js",
+    "test": "node --test dist/*.test.js",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
