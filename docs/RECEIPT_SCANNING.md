@@ -1,70 +1,84 @@
 # Smart receipt scanning and item matching
 
-FairShare treats receipt scanning as a **reconciliation workflow**, not a blind OCR import. The goal is to make wildly different bill layouts usable while never silently creating incorrect balances.
+FairShare treats receipt scanning as a **reconciliation workflow**, not a blind OCR import. The default path has **no paid AI API and no hosted LLM**.
+
+## Default zero-subscription architecture
+
+```text
+receipt photo
+   ↓
+ImageMagick preprocessing (orientation, grayscale, contrast, resize, sharpen)
+   ↓
+Tesseract OCR on the existing FairShare server
+   ↓
+layout-independent deterministic receipt parser
+   ↓
+subtotal / tax / VAT / GST / service / tip / discount classification
+   ↓
+arithmetic reconciliation against the printed grand total
+   ↓
+item-to-person matching UI
+   ↓
+proportional tax/extras allocation + exact-cent conservation
+```
+
+Tesseract is a lightweight OCR engine, not a generative LLM. FairShare runs two page-segmentation passes and chooses the extraction that best reconciles with the bill. The default Docker image includes English OCR. Additional Tesseract language packs can be added later without changing the receipt data model.
+
+`OCR_PROVIDER=local` is the default. The old external vision path remains an **optional** provider only; it is not required and no API key is needed for normal receipt scanning.
 
 ## Target UX
 
 1. **Capture**
    - Camera or gallery.
-   - Auto-crop/deskew/orientation in the native capture layer when available.
-   - Allow retake when confidence is poor or the receipt is cropped.
-   - Future: multi-photo capture for very long receipts.
+   - Server-side orientation/contrast/resize preprocessing now.
+   - Retake when confidence is poor or the receipt is cropped.
+   - Future: multi-photo stitching for very long supermarket receipts.
 
 2. **Understand the bill**
-   - Extract merchant, date, currency and grand total.
-   - Preserve every purchasable line item separately.
+   - Extract merchant, date, currency and grand total where readable.
+   - Preserve purchasable line items separately.
    - Parse quantity notation such as `2 x 14.50`.
-   - Detect VAT/GST/sales tax, service charge, gratuity, tips, fees, discounts and rounding as separate signed adjustments.
-   - Detect tax-inclusive receipts so VAT/GST is not added twice.
-   - Keep tax codes/rates and item groups when the bill exposes them.
+   - Detect VAT/GST/sales tax, service charge, gratuity, tips, fees, discounts and rounding as signed adjustments.
+   - Detect common tax-inclusive wording so VAT/GST is not added twice.
 
 3. **Reconcile before splitting**
    - Compute `sum(items) + non-included adjustments`.
    - Compare that number to the printed grand total.
    - Green: exact match.
-   - Amber: harmless 1–2 cent/fils/paise rounding difference; FairShare can absorb it deterministically.
-   - Red: meaningful mismatch. Do not silently save; highlight low-confidence lines and let the user correct them.
+   - Amber: harmless 1–2 cent/fils/paise rounding difference; FairShare absorbs it deterministically.
+   - Red: meaningful mismatch. The itemized one-tap split is blocked until the user corrects OCR values or retakes the receipt.
 
 4. **Match items to people**
-   - Show each line as a card with price and confidence.
-   - Member chips underneath: tap one person, several people, or everyone.
-   - Shared item amounts divide between the selected people while preserving every cent.
-   - Quick actions: `Me`, `Everyone`, `Same as above`, `Unassign all`.
-   - Future smart suggestions may use only the user's own prior assignment history; suggestions must always remain editable.
+   - Each line has member chips plus `Me`, `Everyone`, `Same as above`, and `Clear` shortcuts.
+   - Shared items divide among selected people while preserving every cent.
+   - `Fix OCR` allows correction of an incorrectly read item name or amount.
 
 5. **Allocate taxes and extras fairly**
-   - Default tax/VAT/GST: proportional to the items each person consumed.
-   - Item-specific tax groups: allocate only to people assigned to affected items.
-   - Service charge: proportional by default, optionally equal.
-   - Tip/gratuity: proportional by default, optionally equal.
-   - Discounts/coupons: proportional to affected item spend unless an item group is known.
+   - Tax/VAT/GST: proportional to the items each person consumed by default.
+   - Service charge: proportional by default.
+   - Tip/gratuity: proportional by default.
+   - Discounts/coupons: signed negative adjustments distributed proportionally.
    - Rounding: deterministic proportional distribution.
-   - Taxes marked as included in item prices are informational and are never charged a second time.
+   - Taxes marked as included in item prices are informational and never charged a second time.
+   - Detected adjustment amounts can be corrected before the split is applied.
 
-6. **Final review**
-   - Show each person's item subtotal, tax/service/tip share, discounts, and final amount.
-   - Show a conservation check: all people must add exactly to the printed grand total.
-   - Save the structured receipt alongside the expense for later audit/editing.
+6. **Final review and audit**
+   - Show each person's item subtotal, tax/extras share, and final amount.
+   - Show a conservation check: all people add exactly to the printed grand total.
+   - Save the structured receipt, reconciliation result and item assignments in `receipt_documents` alongside the expense.
 
-## Layout robustness
+## Supporting different bill designs
 
-The vision extraction prompt is layout-independent and explicitly covers restaurant checks, supermarket bills, hotel invoices, fuel receipts, VAT/GST invoices, multi-column layouts, quantity rows, discounts, and international terminology. We still cannot guarantee perfect extraction from every image. Reliability comes from three layers:
+FairShare does not use merchant-specific pixel templates. The local parser works from OCR lines and receipt semantics, looking for monetary values plus labels such as subtotal, total, VAT, GST, CGST, SGST, IGST, tax, service charge, gratuity, tip, fee, coupon, discount and rounding. That lets the same pipeline handle many restaurant, supermarket, hotel, fuel and international invoice layouts.
 
-1. vision-based semantic extraction rather than fixed pixel coordinates;
-2. arithmetic reconciliation against the printed total;
-3. user confirmation when confidence or arithmetic is poor.
+No OCR system can guarantee every photographed receipt. Reliability comes from three independent checks:
 
-This means an unfamiliar design should normally still work, and an unreadable/cropped/ambiguous design should fail visibly instead of corrupting balances.
+1. OCR confidence;
+2. semantic line classification;
+3. arithmetic reconciliation against the printed total.
 
-## Structured data
+An unfamiliar but readable design should normally work. A faded, cropped or ambiguous receipt should fail visibly instead of silently corrupting balances.
 
-`ReceiptScanResult` now carries:
+## Future on-device path
 
-- line-item confidence and original source text;
-- tax codes/rates when visible;
-- signed adjustments with kinds and optional affected item indexes;
-- tax-inclusive flags;
-- unparsed visible lines and warnings;
-- an arithmetic reconciliation result.
-
-`allocateReceipt()` in `@fairshare/shared` deterministically converts item assignments plus taxes/fees/discounts into final per-person minor-unit balances.
+For Android/iOS we can later use Google ML Kit Text Recognition in a custom Expo development build so the image never needs to leave the device. For web we can optionally run Tesseract.js/WASM in the browser. Both can feed the same deterministic parser and allocation engine, so this migration does not change any expense logic.
