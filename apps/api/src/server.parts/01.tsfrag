@@ -54,7 +54,6 @@ app.post('/api/groups/:groupId/members', async (request, reply) => {
   return reply.status(201).send(details);
 });
 
-
 app.put('/api/groups/:groupId/default-split', async (request) => {
   const actorId = requireUser(request);
   const { groupId } = request.params as { groupId: string };
@@ -84,25 +83,30 @@ app.get('/api/groups/:groupId/expenses', async (request) => {
   const shareStatement = db.prepare(
     `SELECT s.user_id, s.owed_minor, u.display_name FROM expense_shares s JOIN users u ON u.id = s.user_id WHERE s.expense_id = ?`,
   );
-  return rows.map((row) => ({
-    id: row.id,
-    groupId: row.group_id,
-    description: row.description,
-    category: row.category,
-    amountMinor: row.amount_minor,
-    currency: row.currency,
-    paidByUserId: row.paid_by_user_id,
-    paidByName: row.paid_by_name,
-    incurredAt: row.incurred_at,
-    splitMethod: row.split_method,
-    notes: row.notes,
-    receiptItems: row.receipt_items_json ? json(row.receipt_items_json) : [],
-    originalAmountMinor: row.original_amount_minor,
-    originalCurrency: row.original_currency,
-    conversionRate: row.conversion_rate,
-    sourceTransactionId: row.source_transaction_id,
-    shares: (shareStatement.all(row.id) as any[]).map((share) => ({ userId: share.user_id, displayName: share.display_name, owedMinor: share.owed_minor })),
-  }));
+  const receiptStatement = db.prepare('SELECT structured_json FROM receipt_documents WHERE expense_id = ?');
+  return rows.map((row) => {
+    const receiptRow = receiptStatement.get(row.id) as { structured_json?: string } | undefined;
+    return {
+      id: row.id,
+      groupId: row.group_id,
+      description: row.description,
+      category: row.category,
+      amountMinor: row.amount_minor,
+      currency: row.currency,
+      paidByUserId: row.paid_by_user_id,
+      paidByName: row.paid_by_name,
+      incurredAt: row.incurred_at,
+      splitMethod: row.split_method,
+      notes: row.notes,
+      receiptItems: row.receipt_items_json ? json(row.receipt_items_json) : [],
+      receiptDocument: receiptRow?.structured_json ? json(receiptRow.structured_json) : undefined,
+      originalAmountMinor: row.original_amount_minor,
+      originalCurrency: row.original_currency,
+      conversionRate: row.conversion_rate,
+      sourceTransactionId: row.source_transaction_id,
+      shares: (shareStatement.all(row.id) as any[]).map((share) => ({ userId: share.user_id, displayName: share.display_name, owedMinor: share.owed_minor })),
+    };
+  });
 });
 
 const expenseSchema = z.object({
