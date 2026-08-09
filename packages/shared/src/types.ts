@@ -37,6 +37,7 @@ export interface ExpenseInput {
   shares: ExpenseShareInput[];
   notes?: string;
   receiptItems?: Array<ReceiptLineItem & { assignedUserIds: string[] }>;
+  receiptDocument?: ReceiptDocument;
   originalAmountMinor?: number;
   originalCurrency?: CurrencyCode;
   conversionRate?: number;
@@ -118,4 +119,9 @@ export interface ReceiptScanResult {
   warnings?: string[];
   unparsedLines?: string[];
   reconciliation?: ReceiptReconciliation;
+}
+
+export interface ReceiptDocument extends ReceiptScanResult {
+  /** Zero-based receipt item index to group member IDs selected in the matching UI. */
+  itemAssignments?: Record<number, string[]>;
 }
