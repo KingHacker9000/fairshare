@@ -1,12 +1,14 @@
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Alert, Pressable, Text, View } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import {
+  allocateReceipt,
   calculateExpenseShares,
   formatMoney,
   parseDecimalToMinor,
+  reconcileReceipt,
   type ExpenseShareInput,
   type ReceiptScanResult,
   type SplitMethod,
@@ -66,6 +68,7 @@ export default function NewExpenseScreen() {
   const [converting, setConverting] = useState(false);
   const [receipt, setReceipt] = useState<ReceiptScanResult | null>(null);
   const [itemAssignments, setItemAssignments] = useState<ItemAssignments>({});
+  const [editingItemIndex, setEditingItemIndex] = useState<number | null>(null);
   const [originalConversion, setOriginalConversion] = useState<OriginalConversion>(null);
   const [recurring, setRecurring] = useState(false);
   const [cadence, setCadence] = useState<'weekly' | 'monthly' | 'yearly'>('monthly');
@@ -102,6 +105,11 @@ export default function NewExpenseScreen() {
     try { return calculateExpenseShares(amountMinor, method, shareInput); } catch { return null; }
   }, [amountMinor, method, shareInput]);
 
+  const receiptAllocation = useMemo(() => {
+    if (!receipt?.items.length) return null;
+    try { return allocateReceipt(receipt, itemAssignments); } catch { return null; }
+  }, [receipt, itemAssignments]);
+
   if (!group) return <Screen><Loading /></Screen>;
 
   const changeMethod = (nextMethod: SplitMethod) => {
@@ -111,8 +119,8 @@ export default function NewExpenseScreen() {
 
   const pickReceipt = async (camera: boolean) => {
     const result = camera
-      ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.85 })
-      : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.85 });
+      ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.9 })
+      : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9 });
     if (result.canceled || !result.assets[0]) return;
     setScanning(true);
     try {
@@ -124,8 +132,7 @@ export default function NewExpenseScreen() {
       if (scanned.purchasedAt) setIncurredDate(scanned.purchasedAt.slice(0, 10));
       if (scanned.merchant) setDescription(scanned.merchant);
       if (scanned.items?.length) {
-        const allMembers = group.members.map((member) => member.id);
-        setItemAssignments(Object.fromEntries(scanned.items.map((_, index) => [index, allMembers])));
+        setItemAssignments(Object.fromEntries(scanned.items.map((_, index) => [index, []])));
         setNotes(scanned.items.map((item) => `${item.quantity}× ${item.description}: ${(item.totalMinor / 100).toFixed(2)}`).join('\n'));
       }
     } catch (error) {
@@ -133,6 +140,10 @@ export default function NewExpenseScreen() {
     } finally {
       setScanning(false);
     }
+  };
+
+  const setItemPeople = (itemIndex: number, userIds: string[]) => {
+    setItemAssignments((current) => ({ ...current, [itemIndex]: [...new Set(userIds)] }));
   };
 
   const toggleItemMember = (itemIndex: number, userId: string) => {
@@ -144,27 +155,52 @@ export default function NewExpenseScreen() {
     });
   };
 
+  const updateReceipt = (next: ReceiptScanResult) => {
+    next.reconciliation = reconcileReceipt(next);
+    setReceipt(next);
+    if (next.totalMinor !== undefined) setAmount((next.totalMinor / 100).toFixed(2));
+  };
+
+  const updateReceiptItem = (itemIndex: number, patch: { description?: string; totalMinor?: number }) => {
+    if (!receipt) return;
+    const items = receipt.items.map((item, index) => index === itemIndex ? {
+      ...item,
+      ...patch,
+      unitPriceMinor: patch.totalMinor === undefined ? item.unitPriceMinor : Math.round(patch.totalMinor / Math.max(1, item.quantity)),
+    } : item);
+    updateReceipt({ ...receipt, items });
+  };
+
+  const updateReceiptAdjustment = (adjustmentIndex: number, amountText: string) => {
+    if (!receipt?.adjustments) return;
+    try {
+      let amountMinor = parseDecimalToMinor(amountText);
+      const adjustment = receipt.adjustments[adjustmentIndex];
+      if (adjustment?.kind === 'discount' && amountMinor > 0) amountMinor *= -1;
+      const adjustments = receipt.adjustments.map((value, index) => index === adjustmentIndex ? { ...value, amountMinor } : value);
+      updateReceipt({ ...receipt, adjustments });
+    } catch {
+      // Keep the previous parsed adjustment until the field contains a valid amount.
+    }
+  };
+
+  const toggleAdjustmentIncluded = (adjustmentIndex: number) => {
+    if (!receipt?.adjustments) return;
+    const adjustments = receipt.adjustments.map((value, index) => index === adjustmentIndex ? { ...value, includedInItemPrices: !value.includedInItemPrices } : value);
+    updateReceipt({ ...receipt, adjustments });
+  };
+
   const useItemizedSplit = () => {
-    if (!receipt?.items.length || !amountMinor) return;
-    const totals: Record<string, number> = Object.fromEntries(group.members.map((member) => [member.id, 0]));
-    let itemTotal = 0;
-    for (const [index, item] of receipt.items.entries()) {
-      const assigned = itemAssignments[index] ?? [];
-      if (!assigned.length) return Alert.alert('Assign every item', `Choose at least one person for “${item.description}”.`);
-      itemTotal += item.totalMinor;
-      const split = calculateExpenseShares(item.totalMinor, 'equal', assigned.map((userId) => ({ userId })));
-      for (const [userId, value] of Object.entries(split)) totals[userId] = (totals[userId] ?? 0) + value;
+    if (!receipt?.items.length) return;
+    if (!receiptAllocation) return Alert.alert('Assign every item', 'Each receipt line needs at least one person. Use Me, Everyone, Same as above, or the member chips.');
+    if (receiptAllocation.reconciliation.status === 'mismatch') {
+      return Alert.alert('Receipt needs review', `The extracted bill is off by ${formatMoney(Math.abs(receiptAllocation.reconciliation.differenceMinor), expenseCurrency)}. Correct the highlighted item/tax values or retake the photo before applying the itemized split.`);
     }
-    const extras = amountMinor - itemTotal;
-    if (extras < 0) return Alert.alert('Receipt mismatch', 'The scanned line items exceed the receipt total. Correct the amount or item values first.');
-    if (extras > 0) {
-      const participants = group.members.filter((member) => Object.values(itemAssignments).some((assigned) => assigned.includes(member.id)));
-      const extraSplit = calculateExpenseShares(extras, 'equal', participants.map((member) => ({ userId: member.id })));
-      for (const [userId, value] of Object.entries(extraSplit)) totals[userId] = (totals[userId] ?? 0) + value;
-    }
-    setIncluded(Object.fromEntries(group.members.map((member) => [member.id, totals[member.id]! > 0])));
-    setValues(Object.fromEntries(group.members.map((member) => [member.id, (totals[member.id]! / 100).toFixed(2)])));
+    const totals = receiptAllocation.byUser;
+    setIncluded(Object.fromEntries(group.members.map((member) => [member.id, (totals[member.id] ?? 0) !== 0])));
+    setValues(Object.fromEntries(group.members.map((member) => [member.id, ((totals[member.id] ?? 0) / 100).toFixed(2)])));
     setMethod('exact');
+    setAmount(((receiptAllocation.reconciliation.printedTotalMinor ?? Object.values(totals).reduce((sum, value) => sum + value, 0)) / 100).toFixed(2));
   };
 
   const convertToGroupCurrency = async () => {
@@ -179,8 +215,8 @@ export default function NewExpenseScreen() {
       setAmount((convertedAmount / 100).toFixed(2));
       setExpenseCurrency(group.currency.toUpperCase());
       if (receipt) {
-        const scale = (value?: number) => value === undefined ? undefined : Math.max(0, Math.round(value * rate));
-        setReceipt({
+        const scale = (value?: number) => value === undefined ? undefined : Math.round(value * rate);
+        const converted = {
           ...receipt,
           currency: group.currency.toUpperCase(),
           subtotalMinor: scale(receipt.subtotalMinor),
@@ -188,7 +224,10 @@ export default function NewExpenseScreen() {
           tipMinor: scale(receipt.tipMinor),
           totalMinor: convertedAmount,
           items: receipt.items.map((item) => ({ ...item, unitPriceMinor: scale(item.unitPriceMinor)!, totalMinor: scale(item.totalMinor)! })),
-        });
+          adjustments: receipt.adjustments?.map((adjustment) => ({ ...adjustment, amountMinor: scale(adjustment.amountMinor)! })),
+        } as ReceiptScanResult;
+        converted.reconciliation = reconcileReceipt(converted);
+        setReceipt(converted);
       }
       if (method === 'exact' && preview) {
         const convertedShares = calculateExpenseShares(convertedAmount, 'shares', Object.entries(preview).map(([userId, value]) => ({ userId, value })));
@@ -216,6 +255,7 @@ export default function NewExpenseScreen() {
       shares: shareInput,
       notes: notes || undefined,
       receiptItems: receipt?.items.map((item, index) => ({ ...item, assignedUserIds: itemAssignments[index] ?? [] })),
+      receiptDocument: receipt ? { ...receipt, itemAssignments } : undefined,
       originalAmountMinor: originalConversion?.amountMinor,
       originalCurrency: originalConversion?.currency,
       conversionRate: originalConversion?.rate,
@@ -249,14 +289,23 @@ export default function NewExpenseScreen() {
     }
   };
 
+  const reconciliation = receipt?.reconciliation;
+  const reconciliationColor = reconciliation?.status === 'balanced' ? colors.positive : reconciliation?.status === 'rounding' ? colors.warning : colors.danger;
+
   return <Screen>
     <Heading eyebrow={group.name}>New expense</Heading>
     <Card>
       <View style={[ui.row, { gap: 8, flexWrap: 'wrap' }]}>
-        <Button title={scanning ? 'Scanning…' : 'Scan receipt'} variant="secondary" disabled={scanning} onPress={() => { void pickReceipt(true); }} />
+        <Button title={scanning ? 'Reading locally…' : 'Scan receipt'} variant="secondary" disabled={scanning} onPress={() => { void pickReceipt(true); }} />
         <Button title="Choose photo" variant="secondary" disabled={scanning} onPress={() => { void pickReceipt(false); }} />
       </View>
-      {receipt ? <Text style={ui.muted}>Receipt confidence: {Math.round((receipt.confidence ?? 0) * 100)}% · {receipt.items.length} items</Text> : null}
+      {receipt ? <View style={{ gap: 4 }}>
+        <Text style={ui.muted}>Local OCR confidence: {Math.round((receipt.confidence ?? 0) * 100)}% · {receipt.items.length} items</Text>
+        {reconciliation ? <Text style={{ color: reconciliationColor, fontWeight: '800' }}>
+          {reconciliation.status === 'balanced' ? '✓ Receipt arithmetic matches' : reconciliation.status === 'rounding' ? `≈ Rounding difference ${formatMoney(Math.abs(reconciliation.differenceMinor), expenseCurrency)}` : reconciliation.status === 'mismatch' ? `⚠ Needs review — difference ${formatMoney(Math.abs(reconciliation.differenceMinor), expenseCurrency)}` : 'Grand total needs confirmation'}
+        </Text> : null}
+        {receipt.warnings?.slice(0, 3).map((warning, index) => <Text key={index} style={{ color: colors.warning }}>{warning}</Text>)}
+      </View> : null}
       <Field label="Description" value={description} onChangeText={setDescription} placeholder="Dinner" />
       <View style={[ui.row, { gap: 10, alignItems: 'flex-end' }]}>
         <View style={{ flex: 1 }}><Field label="Amount" value={amount} onChangeText={setAmount} keyboardType="decimal-pad" placeholder="0.00" /></View>
@@ -266,20 +315,57 @@ export default function NewExpenseScreen() {
       {originalConversion ? <Text style={ui.muted}>Originally {formatMoney(originalConversion.amountMinor, originalConversion.currency)} · rate {originalConversion.rate.toFixed(6)}</Text> : null}
       <Field label="Date (YYYY-MM-DD)" value={incurredDate} onChangeText={setIncurredDate} autoCapitalize="none" />
       <Field label="Category" value={category} onChangeText={setCategory} placeholder="food" />
-      <Field label="Notes / receipt items" value={notes} onChangeText={setNotes} multiline />
+      <Field label="Notes" value={notes} onChangeText={setNotes} multiline />
     </Card>
 
     {receipt?.items.length ? <Card>
-      <Text style={ui.title}>Assign receipt items</Text>
-      <Text style={ui.muted}>Tap everyone who shared each item. Tax, tip, and rounding are distributed across participants.</Text>
-      {receipt.items.map((item, index) => <View key={`${item.description}-${index}`} style={{ gap: 8, borderTopWidth: index ? 1 : 0, borderTopColor: colors.border, paddingTop: index ? 10 : 0 }}>
-        <View style={ui.between}><Text style={[ui.body, { flex: 1 }]}>{item.quantity}× {item.description}</Text><Text style={ui.body}>{formatMoney(item.totalMinor, expenseCurrency)}</Text></View>
-        <View style={[ui.row, { gap: 7, flexWrap: 'wrap' }]}>{group.members.map((member) => {
-          const active = (itemAssignments[index] ?? []).includes(member.id);
-          return <Pressable key={member.id} onPress={() => toggleItemMember(index, member.id)} style={[ui.chip, active && { backgroundColor: colors.primary }]}><Text style={{ color: active ? '#fff' : colors.ink, fontWeight: '700' }}>{member.displayName}</Text></Pressable>;
-        })}</View>
-      </View>)}
-      <Button title="Apply itemized split" variant="secondary" onPress={useItemizedSplit} />
+      <Text style={ui.title}>Match receipt items</Text>
+      <Text style={ui.muted}>Assign every item. Taxes, service charges, tips, discounts and rounding are then allocated proportionally to what each person consumed.</Text>
+      {receipt.items.map((item, index) => {
+        const assigned = itemAssignments[index] ?? [];
+        const editing = editingItemIndex === index;
+        return <View key={`${item.description}-${index}`} style={{ gap: 8, borderTopWidth: index ? 1 : 0, borderTopColor: colors.border, paddingTop: index ? 12 : 0 }}>
+          <View style={ui.between}>
+            <View style={{ flex: 1, gap: 2 }}><Text style={ui.body}>{item.quantity}× {item.description}</Text>{item.confidence !== undefined ? <Text style={ui.muted}>{Math.round(item.confidence * 100)}% read confidence</Text> : null}</View>
+            <Text style={ui.body}>{formatMoney(item.totalMinor, expenseCurrency)}</Text>
+          </View>
+          <View style={[ui.row, { gap: 7, flexWrap: 'wrap' }]}>
+            <Pressable onPress={() => user?.id && setItemPeople(index, [user.id])} style={ui.chip}><Text style={{ color: colors.primaryDark, fontWeight: '800' }}>Me</Text></Pressable>
+            <Pressable onPress={() => setItemPeople(index, group.members.map((member) => member.id))} style={ui.chip}><Text style={{ color: colors.primaryDark, fontWeight: '800' }}>Everyone</Text></Pressable>
+            {index > 0 ? <Pressable onPress={() => setItemPeople(index, itemAssignments[index - 1] ?? [])} style={ui.chip}><Text style={{ color: colors.primaryDark, fontWeight: '800' }}>Same as above</Text></Pressable> : null}
+            <Pressable onPress={() => setItemPeople(index, [])} style={ui.chip}><Text style={{ color: colors.muted, fontWeight: '800' }}>Clear</Text></Pressable>
+            <Pressable onPress={() => setEditingItemIndex(editing ? null : index)} style={ui.chip}><Text style={{ color: colors.muted, fontWeight: '800' }}>{editing ? 'Done' : 'Fix OCR'}</Text></Pressable>
+          </View>
+          <View style={[ui.row, { gap: 7, flexWrap: 'wrap' }]}>{group.members.map((member) => {
+            const active = assigned.includes(member.id);
+            return <Pressable key={member.id} onPress={() => toggleItemMember(index, member.id)} style={[ui.chip, active && { backgroundColor: colors.primary }]}><Text style={{ color: active ? '#fff' : colors.ink, fontWeight: '700' }}>{member.displayName}</Text></Pressable>;
+          })}</View>
+          {editing ? <View style={{ gap: 8 }}>
+            <Field label="Detected item name" value={item.description} onChangeText={(value) => updateReceiptItem(index, { description: value })} />
+            <Field label={`Detected amount (${expenseCurrency})`} value={(item.totalMinor / 100).toFixed(2)} keyboardType="decimal-pad" onChangeText={(value) => { try { updateReceiptItem(index, { totalMinor: Math.abs(parseDecimalToMinor(value)) }); } catch {} }} />
+            {item.sourceText ? <Text style={ui.muted}>OCR source: {item.sourceText}</Text> : null}
+          </View> : null}
+        </View>;
+      })}
+
+      {receipt.adjustments?.length ? <View style={{ gap: 10, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 12 }}>
+        <Text style={ui.title}>Taxes & extras</Text>
+        {receipt.adjustments.map((adjustment, index) => <View key={`${adjustment.label}-${index}`} style={{ gap: 7 }}>
+          <View style={ui.between}><Text style={[ui.body, { textTransform: 'capitalize' }]}>{adjustment.label}</Text><Text style={adjustment.amountMinor < 0 ? ui.positive : ui.body}>{formatMoney(adjustment.amountMinor, expenseCurrency)}</Text></View>
+          <Field label={`${adjustment.kind.replaceAll('_', ' ')} amount`} value={(Math.abs(adjustment.amountMinor) / 100).toFixed(2)} keyboardType="decimal-pad" onChangeText={(value) => updateReceiptAdjustment(index, value)} />
+          {adjustment.kind === 'tax' ? <Button title={adjustment.includedInItemPrices ? 'Tax is included in item prices ✓' : 'Tax is added on top'} variant="secondary" onPress={() => toggleAdjustmentIncluded(index)} /> : null}
+        </View>)}
+      </View> : null}
+
+      {receiptAllocation && receiptAllocation.reconciliation.status !== 'mismatch' ? <View style={{ gap: 8, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 12 }}>
+        <Text style={ui.title}>Preview final split</Text>
+        {group.members.filter((member) => (receiptAllocation.byUser[member.id] ?? 0) !== 0).map((member) => <View key={member.id} style={ui.between}>
+          <View style={{ flex: 1 }}><Text style={ui.body}>{member.displayName}</Text><Text style={ui.muted}>Items {formatMoney(receiptAllocation.itemSubtotalByUser[member.id] ?? 0, expenseCurrency)} · tax/extras {formatMoney(receiptAllocation.adjustmentByUser[member.id] ?? 0, expenseCurrency)}</Text></View>
+          <Text style={ui.title}>{formatMoney(receiptAllocation.byUser[member.id] ?? 0, expenseCurrency)}</Text>
+        </View>)}
+        <Text style={ui.positive}>✓ Assigned total matches receipt total</Text>
+      </View> : null}
+      <Button title="Apply reconciled itemized split" variant="secondary" onPress={useItemizedSplit} />
     </Card> : null}
 
     <Card>
