@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { reconcileReceipt, type ReceiptAdjustment, type ReceiptLineItem, type ReceiptScanResult } from '@fairshare/shared';
 import { env } from './env.js';
+import { scanReceiptLocally } from './receipt-local.js';
 
 const emptyResult: ReceiptScanResult = { items: [], adjustments: [], confidence: 0, warnings: [] };
 
@@ -27,7 +28,7 @@ function sanitizeItems(value: unknown): ReceiptLineItem[] {
       taxCode: typeof item.taxCode === 'string' ? item.taxCode : undefined,
       taxRatePercent: typeof item.taxRatePercent === 'number' && Number.isFinite(item.taxRatePercent) ? item.taxRatePercent : undefined,
       confidence: typeof item.confidence === 'number' && Number.isFinite(item.confidence) ? Math.max(0, Math.min(1, item.confidence)) : undefined,
-    }];
+    } as ReceiptLineItem];
   });
 }
 
@@ -52,13 +53,13 @@ function sanitizeAdjustments(value: unknown): ReceiptAdjustment[] {
       appliesToItemIndexes: indexes?.length ? indexes : undefined,
       includedInItemPrices: adjustment.includedInItemPrices === true,
       confidence: typeof adjustment.confidence === 'number' && Number.isFinite(adjustment.confidence) ? Math.max(0, Math.min(1, adjustment.confidence)) : undefined,
-    }];
+    } as ReceiptAdjustment];
   });
 }
 
 function sanitizeReceipt(parsed: Record<string, unknown>): ReceiptScanResult {
   const warnings = Array.isArray(parsed.warnings) ? parsed.warnings.filter((value): value is string => typeof value === 'string') : [];
-  const result: ReceiptScanResult = {
+  const result = {
     merchant: typeof parsed.merchant === 'string' ? parsed.merchant.trim() || undefined : undefined,
     address: typeof parsed.address === 'string' ? parsed.address.trim() || undefined : undefined,
     currency: typeof parsed.currency === 'string' ? parsed.currency.trim().toUpperCase().slice(0, 3) || undefined : undefined,
@@ -75,7 +76,7 @@ function sanitizeReceipt(parsed: Record<string, unknown>): ReceiptScanResult {
     confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence) ? Math.max(0, Math.min(1, parsed.confidence)) : 0,
     warnings,
     unparsedLines: Array.isArray(parsed.unparsedLines) ? parsed.unparsedLines.filter((value): value is string => typeof value === 'string') : [],
-  };
+  } as ReceiptScanResult;
 
   result.reconciliation = reconcileReceipt(result);
   if (result.reconciliation.status === 'mismatch') {
@@ -87,10 +88,8 @@ function sanitizeReceipt(parsed: Record<string, unknown>): ReceiptScanResult {
   return result;
 }
 
-export async function scanReceipt(path: string, mimeType: string): Promise<ReceiptScanResult> {
-  if (env.OCR_PROVIDER === 'disabled') return emptyResult;
-  if (!env.OPENAI_API_KEY) throw new Error('Receipt OCR is enabled but OPENAI_API_KEY is missing');
-
+async function scanWithOptionalVision(path: string, mimeType: string): Promise<ReceiptScanResult> {
+  if (!env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is missing for the optional vision provider');
   const data = await readFile(path);
   const response = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
     method: 'POST',
@@ -102,73 +101,27 @@ export async function scanReceipt(path: string, mimeType: string): Promise<Recei
       messages: [
         {
           role: 'system',
-          content: `You are a receipt understanding engine for an expense-splitting app. Receipts may be restaurant checks, supermarket bills, hotel invoices, fuel receipts, handwritten/printed hybrids, VAT/GST invoices, multi-column receipts, or layouts in different countries.
-
-Return one JSON object only. Do not guess unreadable monetary values. Monetary values must be integer minor units in the receipt currency.
-
-Schema:
-{
-  "merchant"?: string,
-  "address"?: string,
-  "currency"?: string,
-  "locale"?: string,
-  "receiptNumber"?: string,
-  "purchasedAt"?: ISO-8601 string,
-  "subtotalMinor"?: integer,
-  "taxMinor"?: integer,
-  "tipMinor"?: integer,
-  "totalMinor"?: integer,
-  "taxIncluded"?: boolean,
-  "confidence": number 0..1,
-  "items": [{
-    "description": string,
-    "quantity": number,
-    "unitPriceMinor": integer,
-    "totalMinor": integer,
-    "sourceText"?: string,
-    "taxCode"?: string,
-    "taxRatePercent"?: number,
-    "confidence"?: number 0..1
-  }],
-  "adjustments": [{
-    "label": string,
-    "kind": "tax"|"tip"|"service_charge"|"fee"|"discount"|"rounding"|"other",
-    "amountMinor": signed integer,
-    "ratePercent"?: number,
-    "appliesToItemIndexes"?: integer[],
-    "includedInItemPrices"?: boolean,
-    "confidence"?: number 0..1
-  }],
-  "warnings"?: string[],
-  "unparsedLines"?: string[]
-}
-
-Rules:
-1. Preserve each purchasable line item separately whenever possible; do not merge unrelated items.
-2. Expand quantity notation such as 2 x 4.50 into quantity=2, unitPriceMinor=450, totalMinor=900.
-3. Discounts must be negative adjustments unless the printed item total already reflects them.
-4. Extract every tax/VAT/GST/service-charge/fee/tip/rounding line separately into adjustments. If a tax is already included in item prices, set includedInItemPrices=true so it is not added twice.
-5. When a tax code or rate clearly applies only to some items, populate appliesToItemIndexes using zero-based item indexes.
-6. Do not treat cash tendered, card payment, change due, previous balance, loyalty points, or suggested tip percentages as purchasable items or additive adjustments.
-7. totalMinor means the final amount actually due/charged. Re-check arithmetic before responding: item totals + non-included adjustments should equal totalMinor. If not, re-read once, then emit a warning rather than inventing a value.
-8. Put visible but unresolved lines in unparsedLines. Lower confidence for blurred/cropped/ambiguous scans.
-9. Handle both tax-exclusive and tax-inclusive regions and labels such as VAT, GST, CGST, SGST, IGST, sales tax, service charge, municipality fee, tourism fee, cover charge, discount, coupon, rounding, gratuity and tip.
-10. Never infer who consumed an item; person matching is handled by the app after extraction.`,
+          content: `Extract a receipt into JSON for an expense-splitting app. Do not guess unreadable monetary values. Monetary values are integer minor units. Return merchant, address, currency, locale, receiptNumber, purchasedAt, subtotalMinor, taxMinor, tipMinor, totalMinor, taxIncluded, confidence, items, adjustments, warnings and unparsedLines. Items have description, quantity, unitPriceMinor, totalMinor, sourceText, taxCode, taxRatePercent and confidence. Adjustments have label, kind (tax|tip|service_charge|fee|discount|rounding|other), signed amountMinor, ratePercent, appliesToItemIndexes, includedInItemPrices and confidence. Preserve item lines, make discounts negative, do not double-count included VAT/GST, exclude payment/tender/change lines, and verify item totals plus non-included adjustments against the printed grand total before responding.`,
         },
         {
           role: 'user',
           content: [
-            { type: 'text', text: 'Extract, itemize, classify adjustments, and reconcile this receipt against its printed grand total.' },
+            { type: 'text', text: 'Extract, itemize and reconcile this receipt.' },
             { type: 'image_url', image_url: { url: `data:${mimeType};base64,${data.toString('base64')}` } },
           ],
         },
       ],
     }),
   });
-  if (!response.ok) throw new Error(`OCR provider failed: ${response.status}`);
+  if (!response.ok) throw new Error(`Optional vision provider failed: ${response.status}`);
   const payload = (await response.json()) as any;
   const content = payload.choices?.[0]?.message?.content;
-  if (typeof content !== 'string') throw new Error('OCR provider returned no structured content');
-  const parsed = JSON.parse(content) as Record<string, unknown>;
-  return sanitizeReceipt(parsed);
+  if (typeof content !== 'string') throw new Error('Optional vision provider returned no structured content');
+  return sanitizeReceipt(JSON.parse(content) as Record<string, unknown>);
+}
+
+export async function scanReceipt(path: string, mimeType: string): Promise<ReceiptScanResult> {
+  if (env.OCR_PROVIDER === 'disabled') return emptyResult;
+  if (env.OCR_PROVIDER === 'local') return scanReceiptLocally(path);
+  return scanWithOptionalVision(path, mimeType);
 }
