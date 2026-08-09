@@ -29,6 +29,20 @@ test('restaurant receipt extracts items, VAT and service charge then reconciles'
   assert.equal(receipt.reconciliation?.status, 'balanced');
 });
 
+test('quantity rows use the final extended price rather than the unit price', () => {
+  const receipt = parseReceiptLines(lines([
+    'Grocery',
+    '2 x 14.50 Sparkling Water 29.00',
+    'Subtotal 29.00',
+    'Total AED 29.00',
+  ]));
+  assert.equal(receipt.items.length, 1);
+  assert.equal(receipt.items[0]?.quantity, 2);
+  assert.equal(receipt.items[0]?.unitPriceMinor, 1450);
+  assert.equal(receipt.items[0]?.totalMinor, 2900);
+  assert.equal(receipt.reconciliation?.status, 'balanced');
+});
+
 test('allocation applies tax and service proportionally to assigned item spend', () => {
   const receipt = parseReceiptLines(lines([
     'Cafe',
