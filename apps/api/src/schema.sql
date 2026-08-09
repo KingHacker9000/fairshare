@@ -97,6 +97,13 @@ CREATE TABLE IF NOT EXISTS expenses (
   UNIQUE (created_by, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS receipt_documents (
+  expense_id TEXT PRIMARY KEY REFERENCES expenses(id) ON DELETE CASCADE,
+  structured_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS expense_shares (
   expense_id TEXT NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES users(id),
@@ -181,5 +188,4 @@ CREATE INDEX IF NOT EXISTS idx_expense_shares_user ON expense_shares(user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_group_date ON payments(group_id, paid_at DESC);
 CREATE INDEX IF NOT EXISTS idx_changes_user_cursor ON changes(user_id, cursor);
 CREATE INDEX IF NOT EXISTS idx_recurring_due ON recurring_rules(active, next_run_at);
-
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_user_date ON bank_transactions(user_id, occurred_at DESC);
