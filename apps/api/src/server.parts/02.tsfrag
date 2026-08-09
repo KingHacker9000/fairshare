@@ -1,6 +1,6 @@
     unitPriceMinor: z.number().int().nonnegative(),
     totalMinor: z.number().int().nonnegative(),
-    assignedUserIds: z.array(z.string()).min(1),
+    assignedUserIds: z.array(z.string()),
   })).max(300).optional(),
   receiptDocument: z.record(z.string(), z.unknown()).optional(),
   originalAmountMinor: z.number().int().positive().optional(),
