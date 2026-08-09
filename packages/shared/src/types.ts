@@ -56,21 +56,66 @@ export interface GroupBalance {
   settlements: BalanceEdge[];
 }
 
+export type ReceiptAdjustmentKind =
+  | 'tax'
+  | 'tip'
+  | 'service_charge'
+  | 'fee'
+  | 'discount'
+  | 'rounding'
+  | 'other';
+
 export interface ReceiptLineItem {
   description: string;
   quantity: number;
   unitPriceMinor: number;
   totalMinor: number;
+  sourceText?: string;
+  taxCode?: string;
+  taxRatePercent?: number;
+  confidence?: number;
+}
+
+export interface ReceiptAdjustment {
+  label: string;
+  kind: ReceiptAdjustmentKind;
+  /** Signed minor units. Discounts should be negative. */
+  amountMinor: number;
+  ratePercent?: number;
+  /** Restrict this adjustment to specific item indexes when the receipt exposes tax/service groups. */
+  appliesToItemIndexes?: number[];
+  /** True when the amount is informational and already contained in item prices. */
+  includedInItemPrices?: boolean;
+  confidence?: number;
+}
+
+export interface ReceiptReconciliation {
+  itemsTotalMinor: number;
+  adjustmentsTotalMinor: number;
+  computedTotalMinor: number;
+  printedTotalMinor?: number;
+  differenceMinor: number;
+  status: 'balanced' | 'rounding' | 'mismatch' | 'unknown';
 }
 
 export interface ReceiptScanResult {
   merchant?: string;
+  address?: string;
   currency?: CurrencyCode;
+  locale?: string;
+  receiptNumber?: string;
   subtotalMinor?: number;
+  /** Kept for compatibility; detailed scans should also populate adjustments. */
   taxMinor?: number;
+  /** Kept for compatibility; detailed scans should also populate adjustments. */
   tipMinor?: number;
   totalMinor?: number;
   purchasedAt?: string;
+  taxIncluded?: boolean;
   items: ReceiptLineItem[];
+  adjustments?: ReceiptAdjustment[];
   confidence: number;
+  warnings?: string[];
+  unparsedLines?: string[];
+  reconciliation?: ReceiptReconciliation;
 }
