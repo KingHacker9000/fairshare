@@ -10,13 +10,14 @@ FairShare is a self-hosted, legally distinct shared-expense app inspired by the 
 - Equal, exact, percentage, shares, and adjustment split engine
 - Deterministic debt simplification
 - Offline queued writes and cursor-based synchronization
-- Camera/gallery receipt OCR and line-item extraction
+- Camera/gallery receipt OCR with **free local Tesseract**, arithmetic reconciliation, OCR correction, line-item/person matching, and proportional tax/service/tip/discount allocation
+- Structured receipt audit documents saved with expenses
 - Live currency-rate endpoint and multi-currency data model
 - Recurring expenses, advanced search, category/month summaries, CSV export
 - Bank-statement CSV transaction import with one-tap conversion into shared expenses
 - Docker Compose deployment, host-Caddy snippet, CI, health checks, backups
 
-See `docs/FEATURES.md`, `docs/PRO_PARITY.md`, and `docs/ARCHITECTURE.md`.
+See `docs/FEATURES.md`, `docs/PRO_PARITY.md`, `docs/RECEIPT_SCANNING.md`, and `docs/ARCHITECTURE.md`.
 
 ## Local development
 
@@ -30,6 +31,19 @@ EXPO_PUBLIC_API_URL=http://YOUR-LAN-IP:8080/api pnpm dev:app
 ```
 
 For Expo Go on the Galaxy Tab, `EXPO_PUBLIC_API_URL` must use the computer/server LAN address, not `localhost`.
+
+### Local receipt scanning
+
+The normal scanner does not require OpenAI or another paid API. It runs ImageMagick + Tesseract on the FairShare API host, then uses deterministic receipt parsing and accounting rules.
+
+On Ubuntu/WSL:
+
+```bash
+sudo apt update
+sudo apt install -y imagemagick tesseract-ocr tesseract-ocr-eng
+```
+
+Or simply run the supplied Docker Compose stack; the API image already contains these packages. The optional external vision environment variables can remain blank.
 
 ## Lightsail deployment
 
@@ -58,7 +72,7 @@ pnpm install
 EXPO_PUBLIC_API_URL=https://fairshare.ashishajin.com/api pnpm --filter @fairshare/app dev
 ```
 
-Android native compilation should use EAS Build or GitHub Actions; Expo Go and the web build can be developed directly from Termux.
+Android native compilation should use a development build or EAS/GitHub Actions when custom native modules are introduced; the current server-side receipt OCR still works from Expo Go.
 
 ## Security
 
